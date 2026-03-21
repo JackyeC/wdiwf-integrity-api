@@ -1,5 +1,15 @@
 """
 WDIWF Company Intelligence Client — Claude-powered
+
+Uses Anthropic Claude to generate company integrity scores
+based on publicly available knowledge about the company.
+
+Scores returned:
+  Reality Gap (0-100)       Culture stated vs lived
+  Civic Footprint (0-100)   ESG/legal/ethical concerns. Higher = worse.
+  Insider Score (0-100)     Insider dysfunction/nepotism signal
+  Workforce Stability       stable | declining | volatile | restructuring
+  Glassdoor Trajectory      improving | stable | declining | deteriorating
 """
 
 from __future__ import annotations
@@ -33,21 +43,24 @@ Return ONLY valid JSON with these exact fields:
   "glassdoor_rating": <float 1.0-5.0 or null if unknown>,
   "reality_gap_evidence": [<2-4 short factual observations about culture vs reality>],
   "insider_score_evidence": [<2-3 observations about leadership network and hiring patterns>],
-  "civic_concerns": [<0-3 specific ESG or legal concerns, empty list if none>],
+  "civic_concerns": [<0-3 specific ESG or legal concerns — empty list if none>],
   "data_confidence": <"high"|"medium"|"low">,
   "summary_for_recruiter": "<1-2 sentence plain summary of overall integrity signal>",
   "disclosure_for_candidate": "<1 honest sentence for a candidate considering this company>"
 }}
 
-Be honest. If a company genuinely has strong culture (Patagonia, REI, Costco), give LOW scores.
-Return only the JSON object — no markdown, no explanation."""
+Be honest and specific. Base scores on publicly known information.
+If a company genuinely has strong values and culture (e.g. Patagonia, REI, Costco, Ben and Jerrys),
+reflect that with LOW reality_gap_score and LOW civic_footprint_score.
+Do not inflate risks for well-regarded, mission-aligned employers.
+Return only the JSON object — no markdown, no explanation, no code fences."""
 
 
 def _compute_risk(reality_gap: int, insider: int, civic: int) -> str:
     if reality_gap > 70 or insider > 70:
-        return "HIGH_RISK"
+        return "HIGH"
     elif reality_gap > 40 or insider > 40 or civic > 40:
-        return "MEDIUM_RISK"
+        return "MODERATE"
     return "LOW"
 
 
@@ -61,10 +74,11 @@ class WDIWFClient:
         company_id: str = None,
         domain: str = None,
     ) -> CompanyIntegrityResult:
+        """Use Claude to generate real company integrity scores."""
         name = company_name or company_id or domain or "Unknown Company"
 
         if not self._anthropic_key:
-            logger.warning("ANTHROPIC_API_KEY not set")
+            logger.warning("ANTHROPIC_API_KEY not set — returning stub")
             return self._zero_stub(name, "no_api_key")
 
         try:
@@ -78,6 +92,8 @@ class WDIWFClient:
             )
 
             raw = message.content[0].text.strip()
+
+            # Strip markdown code fences if Claude wrapped the JSON
             if raw.startswith("```"):
                 lines = raw.split("\n")
                 raw = "\n".join(lines[1:-1]).strip()
@@ -128,7 +144,7 @@ class WDIWFClient:
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"Claude JSON parse error for {name}: {e}")
+            logger.error(f"Claude returned invalid JSON for {name}: {e}")
             return self._zero_stub(name, "parse_error")
         except Exception as e:
             logger.error(f"Claude intel failed for {name}: {e}")
