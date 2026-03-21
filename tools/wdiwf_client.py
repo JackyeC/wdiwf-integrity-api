@@ -3,13 +3,6 @@ WDIWF Company Intelligence Client — Claude-powered
 
 Uses Anthropic Claude to generate company integrity scores
 based on publicly available knowledge about the company.
-
-Scores returned:
-  Reality Gap (0-100)       Culture stated vs lived
-  Civic Footprint (0-100)   ESG/legal/ethical concerns. Higher = worse.
-  Insider Score (0-100)     Insider dysfunction/nepotism signal
-  Workforce Stability       stable | declining | volatile | restructuring
-  Glassdoor Trajectory      improving | stable | declining | deteriorating
 """
 
 from __future__ import annotations
@@ -45,7 +38,7 @@ Return ONLY valid JSON with these exact fields:
   "glassdoor_rating": <float 1.0-5.0 or null if unknown>,
   "reality_gap_evidence": [<2-4 short factual observations about culture vs reality>],
   "insider_score_evidence": [<2-3 observations about leadership network and hiring patterns>],
-  "civic_concerns": [<0-3 specific ESG or legal concerns — empty list if none>],
+  "civic_concerns": [<0-3 specific ESG or legal concerns, empty list if none>],
   "data_confidence": <"high"|"medium"|"low">,
   "summary_for_recruiter": "<1-2 sentence plain summary of overall integrity signal>",
   "disclosure_for_candidate": "<1 honest sentence for a candidate considering this company>"
@@ -54,7 +47,6 @@ Return ONLY valid JSON with these exact fields:
 Be honest and specific. Base scores on publicly known information.
 If a company genuinely has strong values and culture (e.g. Patagonia, REI, Costco, Ben and Jerrys),
 reflect that with LOW reality_gap_score and LOW civic_footprint_score.
-Do not inflate risks for well-regarded, mission-aligned employers.
 Return only the JSON object — no markdown, no explanation, no code fences."""
 
 
@@ -62,15 +54,22 @@ class WDIWFClient:
     def __init__(self, api_key: str = "", base_url: str = "", timeout: float = 30.0):
         self._anthropic_key = os.environ.get("ANTHROPIC_API_KEY", api_key)
 
-    async def get_company_integrity(self, company_name: str) -> CompanyIntegrityResult:
+    async def get_company_integrity(
+        self,
+        company_name: str = None,
+        company_id: str = None,
+        domain: str = None,
+    ) -> CompanyIntegrityResult:
         """Use Claude to generate real company integrity scores."""
+        name = company_name or company_id or domain or "Unknown Company"
+
         if not self._anthropic_key:
             logger.warning("ANTHROPIC_API_KEY not set — returning stub")
-            return self._zero_stub(company_name, "no_api_key")
+            return self._zero_stub(name, "no_api_key")
 
         try:
             client = anthropic.Anthropic(api_key=self._anthropic_key)
-            prompt = INTEL_PROMPT.format(company_name=company_name)
+            prompt = INTEL_PROMPT.format(company_name=name)
 
             message = client.messages.create(
                 model="claude-3-5-haiku-20241022",
@@ -80,23 +79,18 @@ class WDIWFClient:
 
             raw = message.content[0].text.strip()
 
-            # Strip markdown code fences if Claude wrapped the JSON
             if raw.startswith("```"):
                 lines = raw.split("\n")
                 raw = "\n".join(lines[1:-1]).strip()
 
             data = json.loads(raw)
 
-            workforce = WorkforceStabilitySignal(
-                data.get("workforce_stability", "unknown")
-            )
-            glassdoor = GlassdoorTrajectory(
-                data.get("glassdoor_trajectory", "unknown")
-            )
+            workforce = WorkforceStabilitySignal(data.get("workforce_stability", "unknown"))
+            glassdoor = GlassdoorTrajectory(data.get("glassdoor_trajectory", "unknown"))
 
             result = CompanyIntegrityResult(
-                company_id=company_name.lower().replace(" ", "-"),
-                company_name=company_name,
+                company_id=name.lower().replace(" ", "-"),
+                company_name=name,
                 reality_gap_score=int(data.get("reality_gap_score", 0)),
                 civic_footprint_score=int(data.get("civic_footprint_score", 0)),
                 insider_score=int(data.get("insider_score", 0)),
@@ -113,15 +107,15 @@ class WDIWFClient:
             )
 
             result.risk_level = evaluate_company_integrity(result)
-            logger.info(f"Claude intel success for {company_name}: risk={result.risk_level}")
+            logger.info(f"Claude intel success for {name}: risk={result.risk_level}")
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"Claude returned invalid JSON for {company_name}: {e}")
-            return self._zero_stub(company_name, "parse_error")
+            logger.error(f"Claude returned invalid JSON for {name}: {e}")
+            return self._zero_stub(name, "parse_error")
         except Exception as e:
-            logger.error(f"Claude intel failed for {company_name}: {e}")
-            return self._zero_stub(company_name, "api_error")
+            logger.error(f"Claude intel failed for {name}: {e}")
+            return self._zero_stub(name, "api_error")
 
     def _zero_stub(self, company_name: str, reason: str) -> CompanyIntegrityResult:
         return CompanyIntegrityResult(
