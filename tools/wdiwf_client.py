@@ -1,8 +1,5 @@
 """
 WDIWF Company Intelligence Client — Claude-powered
-
-Uses Anthropic Claude to generate company integrity scores
-based on publicly available knowledge about the company.
 """
 
 from __future__ import annotations
@@ -11,7 +8,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
 
 import anthropic
 
@@ -19,7 +15,6 @@ from models.company import (
     CompanyIntegrityResult,
     WorkforceStabilitySignal,
     GlassdoorTrajectory,
-    evaluate_company_integrity,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,10 +39,16 @@ Return ONLY valid JSON with these exact fields:
   "disclosure_for_candidate": "<1 honest sentence for a candidate considering this company>"
 }}
 
-Be honest and specific. Base scores on publicly known information.
-If a company genuinely has strong values and culture (e.g. Patagonia, REI, Costco, Ben and Jerrys),
-reflect that with LOW reality_gap_score and LOW civic_footprint_score.
-Return only the JSON object — no markdown, no explanation, no code fences."""
+Be honest. If a company genuinely has strong culture (Patagonia, REI, Costco), give LOW scores.
+Return only the JSON object — no markdown, no explanation."""
+
+
+def _compute_risk(reality_gap: int, insider: int, civic: int) -> str:
+    if reality_gap > 70 or insider > 70:
+        return "HIGH_RISK"
+    elif reality_gap > 40 or insider > 40 or civic > 40:
+        return "MEDIUM_RISK"
+    return "LOW"
 
 
 class WDIWFClient:
@@ -60,11 +61,10 @@ class WDIWFClient:
         company_id: str = None,
         domain: str = None,
     ) -> CompanyIntegrityResult:
-        """Use Claude to generate real company integrity scores."""
         name = company_name or company_id or domain or "Unknown Company"
 
         if not self._anthropic_key:
-            logger.warning("ANTHROPIC_API_KEY not set — returning stub")
+            logger.warning("ANTHROPIC_API_KEY not set")
             return self._zero_stub(name, "no_api_key")
 
         try:
@@ -78,22 +78,40 @@ class WDIWFClient:
             )
 
             raw = message.content[0].text.strip()
-
             if raw.startswith("```"):
                 lines = raw.split("\n")
                 raw = "\n".join(lines[1:-1]).strip()
 
             data = json.loads(raw)
 
-            workforce = WorkforceStabilitySignal(data.get("workforce_stability", "unknown"))
-            glassdoor = GlassdoorTrajectory(data.get("glassdoor_trajectory", "unknown"))
+            reality_gap = int(data.get("reality_gap_score", 0))
+            civic = int(data.get("civic_footprint_score", 0))
+            insider = int(data.get("insider_score", 0))
+            risk_level = _compute_risk(reality_gap, insider, civic)
+
+            workforce_str = data.get("workforce_stability", "unknown")
+            glassdoor_str = data.get("glassdoor_trajectory", "unknown")
+
+            try:
+                workforce = WorkforceStabilitySignal(workforce_str)
+            except Exception:
+                workforce = WorkforceStabilitySignal.UNKNOWN
+
+            try:
+                glassdoor = GlassdoorTrajectory(glassdoor_str)
+            except Exception:
+                glassdoor = GlassdoorTrajectory.UNKNOWN
 
             result = CompanyIntegrityResult(
                 company_id=name.lower().replace(" ", "-"),
                 company_name=name,
-                reality_gap_score=int(data.get("reality_gap_score", 0)),
-                civic_footprint_score=int(data.get("civic_footprint_score", 0)),
-                insider_score=int(data.get("insider_score", 0)),
+                risk_level=risk_level,
+                reality_gap_score=reality_gap,
+                civic_footprint_score=civic,
+                insider_score=insider,
+                reality_gap_flagged=reality_gap > 70,
+                insider_score_flagged=insider > 70,
+                civic_flagged=civic > 70,
                 workforce_stability=workforce,
                 glassdoor_trajectory=glassdoor,
                 glassdoor_rating=data.get("glassdoor_rating"),
@@ -106,12 +124,11 @@ class WDIWFClient:
                 checked_at=datetime.now(timezone.utc),
             )
 
-            result.risk_level = evaluate_company_integrity(result)
-            logger.info(f"Claude intel success for {name}: risk={result.risk_level}")
+            logger.info(f"Claude intel success for {name}: risk={risk_level}")
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"Claude returned invalid JSON for {name}: {e}")
+            logger.error(f"Claude JSON parse error for {name}: {e}")
             return self._zero_stub(name, "parse_error")
         except Exception as e:
             logger.error(f"Claude intel failed for {name}: {e}")
