@@ -1,131 +1,151 @@
 """
-WDIWF Company Intelligence Client
-wdiwf.jackyeclayton.com
+WDIWF Company Intelligence Client — Claude-powered
 
-GET /api/v1/dossier?company_id={id}
-GET /api/v1/dossier?domain={domain}
-GET /api/v1/dossier?name={company_name}
+Uses Anthropic Claude to generate company integrity scores
+based on publicly available knowledge about the company.
 
-Returns 404 if company not in database — client falls back to zero-scored stub.
+Scores returned:
+  Reality Gap (0-100)       Culture stated vs lived
+  Civic Footprint (0-100)   ESG/legal/ethical concerns. Higher = worse.
+  Insider Score (0-100)     Insider dysfunction/nepotism signal
+  Workforce Stability       stable | declining | volatile | restructuring
+  Glassdoor Trajectory      improving | stable | declining | deteriorating
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, timezone
 from typing import Optional
 
-import httpx
+import anthropic
 
 from models.company import (
-    CompanyDossier, CompanyIntegrityResult,
-    WorkforceStabilitySignal, GlassdoorTrajectory,
+    CompanyIntegrityResult,
+    WorkforceStabilitySignal,
+    GlassdoorTrajectory,
     evaluate_company_integrity,
 )
 
 logger = logging.getLogger(__name__)
 
-WDIWF_BASE_URL = "https://wdiwf.jackyeclayton.com"
-CACHE_TTL_HOURS = 24
+INTEL_PROMPT = """You are the WDIWF Company Intelligence Engine. Assess this company for candidates considering working there.
+
+Company: {company_name}
+
+Return ONLY valid JSON with these exact fields:
+{{
+  "reality_gap_score": <int 0-100, gap between stated and lived culture, higher=worse>,
+  "civic_footprint_score": <int 0-100, ESG/legal/ethical concerns, higher=worse>,
+  "insider_score": <int 0-100, insider dysfunction/nepotism signal, higher=worse>,
+  "workforce_stability": <"stable"|"declining"|"volatile"|"restructuring"|"unknown">,
+  "glassdoor_trajectory": <"improving"|"stable"|"declining"|"deteriorating"|"unknown">,
+  "glassdoor_rating": <float 1.0-5.0 or null if unknown>,
+  "reality_gap_evidence": [<2-4 short factual observations about culture vs reality>],
+  "insider_score_evidence": [<2-3 observations about leadership network and hiring patterns>],
+  "civic_concerns": [<0-3 specific ESG or legal concerns — empty list if none>],
+  "data_confidence": <"high"|"medium"|"low">,
+  "summary_for_recruiter": "<1-2 sentence plain summary of overall integrity signal>",
+  "disclosure_for_candidate": "<1 honest sentence for a candidate considering this company>"
+}}
+
+Be honest and specific. Base scores on publicly known information.
+If a company genuinely has strong values and culture (e.g. Patagonia, REI, Costco, Ben and Jerrys),
+reflect that with LOW reality_gap_score and LOW civic_footprint_score.
+Do not inflate risks for well-regarded, mission-aligned employers.
+Return only the JSON object — no markdown, no explanation, no code fences."""
 
 
 class WDIWFClient:
-    def __init__(self, api_key: str = "", base_url: str = WDIWF_BASE_URL, timeout: float = 15.0):
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-                "User-Agent": "wdiwf-recruiting-agent/1.0",
-            },
-            timeout=timeout,
-        )
-        self._cache: dict[str, tuple[CompanyIntegrityResult, datetime]] = {}
+    def __init__(self, api_key: str = "", base_url: str = "", timeout: float = 30.0):
+        self._anthropic_key = os.environ.get("ANTHROPIC_API_KEY", api_key)
 
-    async def get_company_integrity(
-        self,
-        *,
-        company_id:   Optional[str] = None,
-        company_name: Optional[str] = None,
-        domain:       Optional[str] = None,
-    ) -> CompanyIntegrityResult:
-        cache_key = company_id or domain or (company_name or "").lower().replace(" ", "-")
-
-        if cache_key in self._cache:
-            result, expires = self._cache[cache_key]
-            if datetime.now(timezone.utc) < expires:
-                return result
-
-        dossier = await self._fetch_dossier(company_id=company_id, company_name=company_name, domain=domain)
-        result  = evaluate_company_integrity(dossier)
-        self._cache[cache_key] = (result, datetime.now(timezone.utc) + timedelta(hours=CACHE_TTL_HOURS))
-
-        if result.company_integrity_flag:
-            logger.warning("[WDIWF] HIGH RISK: %s (RG=%.0f IS=%.0f)",
-                           result.company_name, result.reality_gap_score, result.insider_score)
-        return result
-
-    async def _fetch_dossier(self, company_id=None, company_name=None, domain=None) -> CompanyDossier:
-        params = {}
-        if company_id:   params["company_id"] = company_id
-        elif domain:     params["domain"]      = domain
-        elif company_name: params["name"]      = company_name
-        else:
-            raise ValueError("Provide at least one of: company_id, company_name, domain")
+    async def get_company_integrity(self, company_name: str) -> CompanyIntegrityResult:
+        """Use Claude to generate real company integrity scores."""
+        if not self._anthropic_key:
+            logger.warning("ANTHROPIC_API_KEY not set — returning stub")
+            return self._zero_stub(company_name, "no_api_key")
 
         try:
-            resp = await self._client.get("/api/v1/dossier", params=params)
-            if resp.status_code == 404:
-                return self._no_data_stub(company_id or "unknown", company_name or domain or "Unknown Company")
-            resp.raise_for_status()
-            return self._parse_response(resp.json())
-        except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
-            logger.warning("[WDIWF] Fetch failed (%s) — using stub", e)
-            return self._no_data_stub(company_id or "error", company_name or domain or "Unknown Company",
-                                      note=f"WDIWF unavailable: {e}")
+            client = anthropic.Anthropic(api_key=self._anthropic_key)
+            prompt = INTEL_PROMPT.format(company_name=company_name)
 
-    @staticmethod
-    def _parse_response(data: dict) -> CompanyDossier:
-        scores   = data.get("scores", {})
-        signals  = data.get("signals", {})
-        evidence = data.get("evidence", {})
-        meta     = data.get("meta", {})
-        return CompanyDossier(
-            company_id            = data.get("company_id", ""),
-            company_name          = data.get("company_name", ""),
-            domain                = data.get("domain"),
-            industry              = data.get("industry"),
-            employee_count_range  = data.get("employee_count_range"),
-            reality_gap_score     = float(scores.get("reality_gap", 0)),
-            civic_footprint_score = float(scores.get("civic_footprint", 0)),
-            insider_score         = float(scores.get("insider", 0)),
-            workforce_stability   = WorkforceStabilitySignal(signals.get("workforce_stability", "unknown")),
-            glassdoor_trajectory  = GlassdoorTrajectory(signals.get("glassdoor_trajectory", "unknown")),
-            glassdoor_rating      = signals.get("glassdoor_rating"),
-            reality_gap_evidence  = evidence.get("reality_gap", []),
-            insider_score_evidence= evidence.get("insider_score", []),
-            civic_concerns        = evidence.get("civic", []),
-            dossier_as_of         = datetime.fromisoformat(meta["dossier_as_of"]) if meta.get("dossier_as_of") else None,
-            data_confidence       = meta.get("data_confidence", "medium"),
-            wdiwf_profile_url     = meta.get("profile_url"),
-        )
+            message = client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
 
-    @staticmethod
-    def _no_data_stub(company_id: str, company_name: str, note: str = "Company not yet in WDIWF database") -> CompanyDossier:
-        return CompanyDossier(
-            company_id           = company_id,
-            company_name         = company_name,
-            reality_gap_score    = 0.0,
-            civic_footprint_score= 0.0,
-            insider_score        = 0.0,
-            workforce_stability  = WorkforceStabilitySignal.UNKNOWN,
-            glassdoor_trajectory = GlassdoorTrajectory.UNKNOWN,
-            data_confidence      = "low",
-            reality_gap_evidence = [note],
+            raw = message.content[0].text.strip()
+
+            # Strip markdown code fences if Claude wrapped the JSON
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                raw = "\n".join(lines[1:-1]).strip()
+
+            data = json.loads(raw)
+
+            workforce = WorkforceStabilitySignal(
+                data.get("workforce_stability", "unknown")
+            )
+            glassdoor = GlassdoorTrajectory(
+                data.get("glassdoor_trajectory", "unknown")
+            )
+
+            result = CompanyIntegrityResult(
+                company_id=company_name.lower().replace(" ", "-"),
+                company_name=company_name,
+                reality_gap_score=int(data.get("reality_gap_score", 0)),
+                civic_footprint_score=int(data.get("civic_footprint_score", 0)),
+                insider_score=int(data.get("insider_score", 0)),
+                workforce_stability=workforce,
+                glassdoor_trajectory=glassdoor,
+                glassdoor_rating=data.get("glassdoor_rating"),
+                reality_gap_evidence=data.get("reality_gap_evidence", []),
+                insider_score_evidence=data.get("insider_score_evidence", []),
+                civic_concerns=data.get("civic_concerns", []),
+                data_confidence=data.get("data_confidence", "medium"),
+                summary_for_recruiter=data.get("summary_for_recruiter", ""),
+                disclosure_for_candidate=data.get("disclosure_for_candidate", ""),
+                checked_at=datetime.now(timezone.utc),
+            )
+
+            result.risk_level = evaluate_company_integrity(result)
+            logger.info(f"Claude intel success for {company_name}: risk={result.risk_level}")
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Claude returned invalid JSON for {company_name}: {e}")
+            return self._zero_stub(company_name, "parse_error")
+        except Exception as e:
+            logger.error(f"Claude intel failed for {company_name}: {e}")
+            return self._zero_stub(company_name, "api_error")
+
+    def _zero_stub(self, company_name: str, reason: str) -> CompanyIntegrityResult:
+        return CompanyIntegrityResult(
+            company_id=reason,
+            company_name=company_name,
+            risk_level="LOW",
+            reality_gap_flagged=False,
+            insider_score_flagged=False,
+            civic_flagged=False,
+            company_integrity_flag=None,
+            summary_for_recruiter=f"Intelligence unavailable for {company_name}.",
+            disclosure_for_candidate="No data available. Research independently before applying.",
+            reality_gap_score=0,
+            civic_footprint_score=0,
+            insider_score=0,
+            workforce_stability=WorkforceStabilitySignal.UNKNOWN,
+            glassdoor_trajectory=GlassdoorTrajectory.UNKNOWN,
+            glassdoor_rating=None,
+            reality_gap_evidence=[],
+            insider_score_evidence=[],
+            civic_concerns=[],
+            checked_at=datetime.now(timezone.utc),
+            data_confidence="low",
         )
 
     async def close(self):
-        await self._client.aclose()
-
-    async def __aenter__(self): return self
-    async def __aexit__(self, *args): await self.close()
+        pass
