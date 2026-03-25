@@ -31,7 +31,7 @@ class JobPosting(BaseModel):
     job_title:       str
     company_name:    str
     company_domain:  Optional[str] = None
-    job_description: str
+    job_description: str           = ""
     location:        Optional[str] = None
     salary_range:    Optional[str] = None
     posted_url:      Optional[str] = None
